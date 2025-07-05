@@ -7,7 +7,7 @@ System for ride booking with driver confirmation via WhatsApp and automatic Goog
 ### 1. **Ride Request Created**
 - User/System creates ride via API
 
-###2. **System proceeds to schedule ride**
+### 2. **System proceeds to schedule ride**
 ```
 - Ride scheduled → Status: "scheduled"
 - Conflict detected → Status: "rejected"
