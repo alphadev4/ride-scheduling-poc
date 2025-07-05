@@ -1,4 +1,4 @@
-# 🚗 Ride Booking System with WhatsApp & Google Calendar
+# Ride Booking System with WhatsApp & Google Calendar
 
 System for ride booking with driver confirmation via WhatsApp and automatic Google Calendar scheduling.
 
@@ -90,7 +90,7 @@ npm run dev
 3. Share with service account email
 4. Grant **"Make changes to events"** permission
 
-## 📱 Twilio Setup (Optional)
+## Twilio Setup (Optional)
 
 ### For Testing (Mock Mode)
 - Set `MOCK_TWILIO = true` in `server.js` (line 18)
@@ -103,7 +103,7 @@ npm run dev
 4. Set `MOCK_TWILIO = false` in `server.js`
 5. Uncomment lines 68-73 in `sendTwilioMessage` function
 
-## 🧪 Testing
+## Testing
 
 ### Health Check
 ```bash
@@ -133,7 +133,7 @@ curl -X POST http://localhost:3000/api/whatsapp/webhook \
 curl http://localhost:3000/ride/status/test_001
 ```
 
-## 📚 API Documentation
+## API Documentation
 
 ### Create Ride Request
 ```http
@@ -179,14 +179,6 @@ GET /ride/status/{rideId}
     "createdAt": "2025-07-05T10:30:00Z"
   }
 }
-```
-
-### WhatsApp Webhook
-```http
-POST /api/whatsapp/webhook
-Content-Type: application/x-www-form-urlencoded
-
-Body=yes&From=whatsapp:+923174104964
 ```
 
 ### Health Check
