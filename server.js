@@ -26,7 +26,7 @@ const twilioClient = twilio(
 
 // Google Calendar configuration
 const auth = new google.auth.GoogleAuth({
-  keyFile: './creds.json', // Put your JSON file here
+  keyFile: './heroic-grove-465018-h0-626c30a9a60a.json', // Put your JSON file here
   scopes: ["https://www.googleapis.com/auth/calendar"],
 });
 
@@ -122,6 +122,43 @@ const RideSchema = new mongoose.Schema(
     timestamps: true
   }
 );
+
+const ConversationSchema = new mongoose.Schema({
+  phone: {
+    type: String,
+    required: true,
+    validate: {
+      validator: function(v) {
+        return /^\+[1-9]\d{1,14}$/.test(v);
+      },
+      message: 'Invalid phone number format'
+    }
+  },
+  step: {
+    type: String,
+    enum: ['waiting_for_from', 'waiting_for_to', 'waiting_for_time', 'waiting_for_duration', 'waiting_for_driver', 'completed'],
+    default: 'waiting_for_from'
+  },
+  rideData: {
+    from: { type: String, default: null },
+    to: { type: String, default: null },
+    time: { type: String, default: null },
+    estimatedDuration: { type: Number, default: null }, // Add this line
+    driverPhone: { type: String, default: null }
+  },
+  lastMessageAt: {
+    type: Date,
+    default: Date.now
+  },
+  isActive: {
+    type: Boolean,
+    default: true
+  }
+}, { timestamps: true });
+
+ConversationSchema.index({ lastMessageAt: 1 }, { expireAfterSeconds: 1800 });
+
+const Conversation = mongoose.model('Conversation', ConversationSchema);
 
 const UserSchema = new mongoose.Schema({
   phone: { 
@@ -566,6 +603,471 @@ app.get("/health", async (req, res) => {
     });
   }
 });
+
+async function getOrCreateConversation(phone) {
+  let conversation = await Conversation.findOne({ 
+    phone: phone, 
+    isActive: true 
+  });
+  
+  if (!conversation) {
+    conversation = new Conversation({
+      phone: phone,
+      step: 'waiting_for_from',
+      rideData: {}
+    });
+    await conversation.save();
+  }
+  
+  return conversation;
+}
+
+async function updateConversationStep(phone, step, data = {}) {
+  const conversation = await Conversation.findOneAndUpdate(
+    { phone: phone, isActive: true },
+    { 
+      step: step,
+      $set: Object.keys(data).reduce((acc, key) => {
+        acc[`rideData.${key}`] = data[key];
+        return acc;
+      }, {}),
+      lastMessageAt: new Date()
+    },
+    { new: true }
+  );
+  
+  return conversation;
+}
+
+async function processConversationMessage(phone, message) {
+  const conversation = await getOrCreateConversation(phone);
+  const userMessage = message.trim();
+  
+  console.log(`Processing message from ${phone}: "${userMessage}" (Step: ${conversation.step})`);
+  
+  let responseMessage = '';
+  let nextStep = conversation.step;
+  let updateData = {};
+  
+  switch (conversation.step) {
+    case 'waiting_for_from':
+      if (userMessage.toLowerCase().includes('ride') || userMessage.toLowerCase().includes('book')) {
+        responseMessage = `🚗 *RIDE BOOKING STARTED*\n\nGreat! I'll help you book a ride.\n\nPlease tell me your *From (Current location)*:`;
+        nextStep = 'waiting_for_from';
+      } else if (userMessage.length > 2) {
+        updateData.from = userMessage;
+        responseMessage = `📍 *From (Current location):* ${userMessage}\n\nNow, please tell me your *Destination (Drop-off location)*:`;
+        nextStep = 'waiting_for_to';
+      } else {
+        responseMessage = `Please provide a valid pickup location.\n\n*From (Current location):* Where are you starting from?`;
+      }
+      break;
+      
+    case 'waiting_for_to':
+      if (userMessage.length > 2) {
+        updateData.to = userMessage;
+        responseMessage = `📍 *Destination (Drop-off):* ${userMessage}\n\nWhen do you need this ride?\n\n*Time (Departure time):*\nPlease provide:\n- "now" for immediate pickup\n- "today 3:00 PM"\n- "tomorrow 9:00 AM"\n- "Dec 25 2:30 PM"`;
+        nextStep = 'waiting_for_time';
+      } else {
+        responseMessage = `Please provide a valid destination.\n\n*Destination (Drop-off location):* Where would you like to go?`;
+      }
+      break;
+      
+    case 'waiting_for_time':
+      const timeResult = parseTimeInput(userMessage);
+      if (timeResult.success) {
+        updateData.time = timeResult.datetime;
+        responseMessage = `⏰ *Time (Departure time):* ${moment(timeResult.datetime).format('MMMM Do YYYY, h:mm A')}\n\nHow long do you expect this ride to take?\n\n*Estimated Duration:*\nPlease provide duration in minutes:\n- "30" for 30 minutes\n- "60" for 1 hour\n- "90" for 1.5 hours`;
+        nextStep = 'waiting_for_duration';
+      } else {
+        responseMessage = `⚠️ I couldn't understand the time.\n\n*Time (Departure time):* Please try:\n- "now" for immediate\n- "today 3:00 PM"\n- "tomorrow 9:00 AM"\n- "Dec 25 2:30 PM"`;
+      }
+      break;
+      
+    case 'waiting_for_duration':
+      const duration = parseDurationInput(userMessage);
+      if (duration.success) {
+        updateData.estimatedDuration = duration.minutes;
+        responseMessage = `⏱️ *Estimated Duration:* ${duration.minutes} minutes\n\nFinally, please provide the driver's phone number:\n\n*Driver Contact:*\nWith country code (e.g., +923001234567)`;
+        nextStep = 'waiting_for_driver';
+      } else {
+        responseMessage = `⚠️ Invalid duration format.\n\n*Estimated Duration:* Please provide duration in minutes:\n- "30" for 30 minutes\n- "60" for 1 hour\n- "90" for 1.5 hours\n- Or just type a number like "45"`;
+      }
+      break;
+      
+    case 'waiting_for_driver':
+      const phoneRegex = /^\+[1-9]\d{1,14}$/;
+      // Extract phone number from message
+      const phoneMatch = userMessage.match(/\+[1-9]\d{1,14}/);
+      const driverPhone = phoneMatch ? phoneMatch[0] : userMessage;
+      
+      if (phoneRegex.test(driverPhone)) {
+        updateData.driverPhone = driverPhone;
+        
+        // Now we have all the data - let's book the ride!
+        const updatedConversation = await updateConversationStep(phone, 'completed', updateData);
+        
+        // Show summary before booking
+        const summaryMessage = `📋 *BOOKING SUMMARY*\n\n📍 *From:* ${updatedConversation.rideData.from}\n📍 *Destination:* ${updatedConversation.rideData.to}\n⏰ *Time:* ${moment(updatedConversation.rideData.time).format('MMMM Do YYYY, h:mm A')}\n⏱️ *Duration:* ${updatedConversation.rideData.estimatedDuration} minutes\n🚗 *Driver:* ${driverPhone}\n\n⚡ Processing your booking...`;
+        
+        // Send summary first
+        await sendNotification(`whatsapp:${phone}`, summaryMessage);
+        
+        try {
+          // Call your existing booking API internally
+          const bookingResult = await bookRideInternal({
+            driverPhone: driverPhone,
+            riderPhone: phone,
+            from: updatedConversation.rideData.from,
+            to: updatedConversation.rideData.to,
+            time: updatedConversation.rideData.time,
+            estimatedDuration: updatedConversation.rideData.estimatedDuration
+          });
+          
+          if (bookingResult.success) {
+            responseMessage = `✅ *RIDE BOOKED SUCCESSFULLY!*\n\n🆔 *Ride ID:* ${bookingResult.rideId}\n📍 *From:* ${updatedConversation.rideData.from}\n📍 *To:* ${updatedConversation.rideData.to}\n⏰ *Departure:* ${moment(updatedConversation.rideData.time).format('MMMM Do YYYY, h:mm A')}\n⏱️ *Duration:* ${updatedConversation.rideData.estimatedDuration} minutes\n🚗 *Driver:* ${driverPhone}\n\n🎉 *Status: ${bookingResult.autoDecision}*\n\n${bookingResult.message}\n\nType "ride" to book another ride.`;
+          } else {
+            responseMessage = `❌ *BOOKING FAILED*\n\n${bookingResult.message}\n\n📋 *Details:*\n${bookingResult.conflictSummary || 'Unknown error'}\n\n💡 Please try booking for a different time or contact the driver directly.\n\nType "ride" to try again.`;
+          }
+        } catch (error) {
+          console.error('Internal booking error:', error);
+          responseMessage = `❌ *SYSTEM ERROR*\n\nSorry, there was an error processing your booking. Please try again later.\n\nType "ride" to start over.`;
+        }
+        
+        // Mark conversation as completed
+        await Conversation.findOneAndUpdate(
+          { phone: phone, isActive: true },
+          { isActive: false }
+        );
+        
+        return responseMessage;
+      } else {
+        responseMessage = `⚠️ Invalid phone number format.\n\n*Driver Contact:* Please provide the driver's phone number with country code.\n\nExample: +923001234567`;
+      }
+      break;
+      
+    default:
+      responseMessage = `Hello! 👋\n\nSend "ride" or "book ride" to start booking a new ride.\n\nI'll help you book by asking for:\n📍 From (Current location)\n📍 Destination (Drop-off)\n⏰ Time (Departure time)\n⏱️ Estimated Duration\n🚗 Driver Contact`;
+      nextStep = 'waiting_for_from';
+  }
+  
+  // Update conversation
+  await updateConversationStep(phone, nextStep, updateData);
+  
+  return responseMessage;
+}
+
+function parseDurationInput(input) {
+  const inputStr = input.toLowerCase().trim();
+  
+  try {
+    // Extract numbers from the input
+    const numberMatch = inputStr.match(/\d+/);
+    if (!numberMatch) {
+      return { success: false, error: 'No number found' };
+    }
+    
+    const number = parseInt(numberMatch[0]);
+    
+    // Check for hour indicators
+    if (inputStr.includes('hour') || inputStr.includes('hr')) {
+      const minutes = number * 60;
+      if (minutes >= 15 && minutes <= 480) { // 15 min to 8 hours
+        return { success: true, minutes: minutes };
+      }
+    }
+    
+    // Check for minute indicators or just number
+    if (inputStr.includes('min') || inputStr.includes('minute') || /^\d+$/.test(inputStr.trim())) {
+      if (number >= 15 && number <= 480) { // 15 min to 8 hours
+        return { success: true, minutes: number };
+      }
+    }
+    
+    // Handle decimal hours (e.g., "1.5 hours")
+    const decimalMatch = inputStr.match(/(\d+\.?\d*)\s*(hour|hr)/);
+    if (decimalMatch) {
+      const hours = parseFloat(decimalMatch[1]);
+      const minutes = Math.round(hours * 60);
+      if (minutes >= 15 && minutes <= 480) {
+        return { success: true, minutes: minutes };
+      }
+    }
+    
+    return { success: false, error: 'Duration out of range (15-480 minutes)' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+// Time parsing helper
+function parseTimeInput(input) {
+  const now = moment();
+  const inputLower = input.toLowerCase().trim();
+  
+  try {
+    // Handle "now" or "immediately"
+    if (inputLower.includes('now') || inputLower.includes('immediate')) {
+      return { success: true, datetime: now.toISOString() };
+    }
+    
+    // Handle "today" + time
+    if (inputLower.includes('today')) {
+      const timeStr = inputLower.replace('today', '').trim();
+      const time = moment(timeStr, ['h:mm A', 'H:mm', 'h A'], true);
+      if (time.isValid()) {
+        const today = moment().hour(time.hour()).minute(time.minute()).second(0);
+        if (today.isBefore(now)) {
+          today.add(1, 'day'); // If time has passed, assume tomorrow
+        }
+        return { success: true, datetime: today.toISOString() };
+      }
+    }
+    
+    // Handle "tomorrow" + time
+    if (inputLower.includes('tomorrow')) {
+      const timeStr = inputLower.replace('tomorrow', '').trim();
+      const time = moment(timeStr, ['h:mm A', 'H:mm', 'h A'], true);
+      if (time.isValid()) {
+        const tomorrow = moment().add(1, 'day').hour(time.hour()).minute(time.minute()).second(0);
+        return { success: true, datetime: tomorrow.toISOString() };
+      }
+    }
+    
+    // Try to parse as full date-time
+    const formats = [
+      'MMMM Do YYYY, h:mm A',
+      'MMM Do YYYY, h:mm A', 
+      'MM/DD/YYYY h:mm A',
+      'DD/MM/YYYY h:mm A',
+      'YYYY-MM-DD h:mm A',
+      'MMMM Do h:mm A',
+      'MMM Do h:mm A',
+      'MM/DD h:mm A',
+      'DD/MM h:mm A'
+    ];
+    
+    for (const format of formats) {
+      const parsed = moment(input, format, true);
+      if (parsed.isValid() && parsed.isAfter(now)) {
+        return { success: true, datetime: parsed.toISOString() };
+      }
+    }
+    
+    return { success: false, error: 'Could not parse time' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Internal booking function (reuses your existing logic)
+async function bookRideInternal(rideData) {
+  try {
+    const { driverPhone, riderPhone, from, to, time, estimatedDuration } = rideData;
+    
+    // Validate future time
+    if (moment(time).isBefore(moment())) {
+      return {
+        success: false,
+        message: "Ride time must be in the future"
+      };
+    }
+    
+    const rideId = `ride_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const duration = estimatedDuration || 60; // Use provided duration or default to 60
+    
+    // Check conflicts (reuse your existing function)
+    const conflictResult = await checkCalendarConflicts(driverPhone, riderPhone, time, duration);
+    
+    // Auto-decide
+    const status = conflictResult.hasConflict ? "auto_rejected" : "auto_accepted";
+    
+    // Create ride record
+    const ride = new Ride({
+      rideId,
+      driverPhone,
+      riderPhone,
+      from: from.trim(),
+      to: to.trim(),
+      requestedTime: moment(time).toDate(),
+      status,
+      estimatedDuration: duration, // Use the actual provided duration
+      conflictDetails: conflictResult.conflicts,
+      processedAt: new Date()
+    });
+    
+    if (conflictResult.hasConflict && conflictResult.rejectionReason) {
+      ride.rejectionReason = conflictResult.rejectionReason;
+    }
+    
+    await ride.save();
+    
+    // Create calendar event if accepted
+    let googleEventId = null;
+    if (status === "auto_accepted") {
+      try {
+        googleEventId = await createCalendarEvent(ride);
+        ride.googleEventId = googleEventId;
+        await ride.save();
+      } catch (calendarError) {
+        console.error("Calendar creation failed:", calendarError);
+      }
+    }
+    
+    // Update user records
+    await User.findOneAndUpdate(
+      { phone: riderPhone },
+      { 
+        phone: riderPhone,
+        lastRideAt: status === "auto_accepted" ? new Date() : undefined,
+        $inc: { totalRides: status === "auto_accepted" ? 1 : 0 }
+      },
+      { upsert: true }
+    );
+    
+    return {
+      success: true,
+      rideId: ride.rideId,
+      status: ride.status,
+      autoDecision: status === "auto_accepted" ? "ACCEPTED" : "REJECTED",
+      message: status === "auto_accepted" ? 
+        "Ride automatically accepted and booked!" : 
+        "Ride automatically rejected due to conflicts",
+      requestedTime: ride.requestedTime,
+      estimatedDuration: ride.estimatedDuration,
+      calendarEventId: googleEventId,
+      hasConflicts: conflictResult.hasConflict,
+      rejectionReason: conflictResult.rejectionReason,
+      conflictSummary: conflictResult.summary,
+      conflicts: conflictResult.conflicts
+    };
+    
+  } catch (error) {
+    console.error("Internal booking error:", error);
+    return {
+      success: false,
+      message: "System error during booking",
+      error: error.message
+    };
+  }
+}
+
+// WEBHOOK ENDPOINT for WhatsApp
+app.post('/webhook/whatsapp', async (req, res) => {
+  try {
+    console.log('WhatsApp webhook received:', JSON.stringify(req.body, null, 2));
+    
+    // Twilio WhatsApp webhook structure
+    const message = req.body.Body;
+    const from = req.body.From; // Format: whatsapp:+1234567890
+    const to = req.body.To;
+    
+    if (!message || !from) {
+      return res.status(400).send('Invalid webhook data');
+    }
+    
+    // Extract phone number (remove "whatsapp:" prefix)
+    const phoneNumber = from.replace('whatsapp:', '');
+    
+    console.log(`Processing WhatsApp message from ${phoneNumber}: "${message}"`);
+    
+    // Process the conversation
+    const responseMessage = await processConversationMessage(phoneNumber, message);
+    
+    // Send response back via WhatsApp
+    await sendNotification(from, responseMessage);
+    
+    // Respond to Twilio webhook
+    res.status(200).send('OK');
+    
+  } catch (error) {
+    console.error('WhatsApp webhook error:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Helper endpoint to check active conversations (for debugging)
+app.get('/conversations/active', async (req, res) => {
+  try {
+    const conversations = await Conversation.find({ isActive: true });
+    res.json({ 
+      success: true,
+      count: conversations.length,
+      conversations: conversations.map(c => ({
+        phone: c.phone,
+        step: c.step,
+        rideData: c.rideData,
+        lastMessageAt: c.lastMessageAt
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch conversations' });
+  }
+});
+
+// Helper endpoint to reset a conversation (for debugging)
+app.post('/conversations/reset', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ success: false, error: 'Phone number required' });
+    }
+    
+    await Conversation.findOneAndUpdate(
+      { phone: phone },
+      { isActive: false }
+    );
+    
+    res.json({ success: true, message: 'Conversation reset' });
+  } catch (error) {
+    console.error('Error resetting conversation:', error);
+    res.status(500).json({ success: false, error: 'Failed to reset conversation' });
+  }
+});
+
+// Update your existing health check to include conversation stats
+app.get("/health", async (req, res) => {
+  try {
+    const dbStatus = db.readyState === 1 ? "connected" : "disconnected";
+    
+    let calendarStatus = "unknown";
+    try {
+      await calendar.calendars.get({ calendarId: "primary" });
+      calendarStatus = "connected";
+    } catch {
+      calendarStatus = "error";
+    }
+
+    const stats = {
+      totalRides: await Ride.countDocuments(),
+      autoAccepted: await Ride.countDocuments({ status: "auto_accepted" }),
+      autoRejected: await Ride.countDocuments({ status: "auto_rejected" }),
+      completedRides: await Ride.countDocuments({ status: "completed" }),
+      activeConversations: await Conversation.countDocuments({ isActive: true }),
+      totalUsers: await User.countDocuments()
+    };
+    
+    res.json({
+      status: "ok",
+      mode: "FULLY_AUTOMATED + WHATSAPP",
+      database: dbStatus,
+      calendar: calendarStatus,
+      twilio: MOCK_TWILIO ? "mock" : "real",
+      stats,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: "error",
+      error: "Health check failed",
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+console.log(`\nWhatsApp Integration Added!`);
+console.log(`POST /webhook/whatsapp   - WhatsApp webhook endpoint`);
+console.log(`GET  /conversations/active - View active conversations`);
 
 // Start server
 app.listen(port, () => {
